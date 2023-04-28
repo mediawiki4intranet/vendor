@@ -22,17 +22,20 @@
  */
 namespace IPSet;
 
+use JsonSerializable;
+
 /**
  * Matches IP addresses against a set of CIDR specifications
  *
  * Usage:
  *
+ *     use Wikimedia\IPSet;
  *     // At startup, calculate the optimized data structure for the set:
- *     $ipset = new IPSet( array(
+ *     $ipset = new IPSet( [
  *         '208.80.154.0/26',
  *         '2620:0:861:1::/64',
  *         '10.64.0.0/22',
- *     ) );
+ *     ] );
  *
  *     // Runtime check against cached set (returns bool):
  *     $allowme = $ipset->match( $ip );
@@ -44,7 +47,7 @@ namespace IPSet;
  * much larger.
  *
  * For mixed-family CIDR sets, however, this code gives well over
- * 100x speedup vs iterating IP::isInRange() over an array
+ * 100x speedup vs iterating Wikimedia\IPUtils::isInRange() over an array
  * of CIDR specs.
  *
  * The basic implementation is two separate binary trees
@@ -65,26 +68,26 @@ namespace IPSet;
  *
  * The v4 tree would look like:
  *
- *     root4 => array(
+ *     root4 => [
  *         'comp' => 25,
- *         'next' => array(
+ *         'next' => [
  *             0 => true,
- *             1 => array(
+ *             1 => [
  *                 0 => false,
  *                 1 => true,
- *             ),
- *         ),
- *     );
+ *             ],
+ *         ],
+ *     ];
  *
  * (multi-byte compression nodes were attempted as well, but were
  * a net loss in my test scenarios due to additional match complexity)
  */
-class IPSet {
-	/** @var array $root4 The root of the IPv4 matching tree */
-	private $root4 = array( false, false );
+class IPSet implements JsonSerializable {
+	/** @var array|bool The root of the IPv4 matching tree */
+	private $root4 = false;
 
-	/** @var array $root6 The root of the IPv6 matching tree */
-	private $root6 = array( false, false );
+	/** @var array|bool The root of the IPv6 matching tree */
+	private $root6 = false;
 
 	/**
 	 * Instantiate the object from an array of CIDR specs
@@ -98,19 +101,15 @@ class IPSet {
 		foreach ( $cfg as $cidr ) {
 			$this->addCidr( $cidr );
 		}
-
-		self::recOptimize( $this->root4 );
-		self::recCompress( $this->root4, 0, 24 );
-		self::recOptimize( $this->root6 );
-		self::recCompress( $this->root6, 0, 120 );
 	}
 
 	/**
 	 * Add a single CIDR spec to the internal matching trees
 	 *
 	 * @param string $cidr String CIDR spec, IPv[46], optional /mask (def all-1's)
+	 * @return bool Returns true on success, false on failure
 	 */
-	private function addCidr( $cidr ) {
+	private function addCidr( $cidr ): bool {
 		// v4 or v6 check
 		if ( strpos( $cidr, ':' ) === false ) {
 			$node =& $this->root4;
@@ -125,46 +124,78 @@ class IPSet {
 			$net = $cidr;
 			$mask = $defMask;
 		} else {
-			list( $net, $mask ) = explode( '/', $cidr, 2 );
-			if ( !ctype_digit( $mask ) || intval( $mask ) > $defMask ) {
+			[ $net, $mask ] = explode( '/', $cidr, 2 );
+			if ( (int)$mask > $defMask || !ctype_digit( $mask ) ) {
 				trigger_error( "IPSet: Bad mask '$mask' from '$cidr', ignored", E_USER_WARNING );
-				return;
+				return false;
 			}
 		}
-		$mask = intval( $mask ); // explicit integer convert, checked above
+		// explicit integer convert, checked above
+		$mask = (int)$mask;
 
 		// convert $net to an array of integer bytes, length 4 or 16:
 		$raw = inet_pton( $net );
 		if ( $raw === false ) {
-			return; // inet_pton() sends an E_WARNING for us
+			return false;
 		}
 		$rawOrd = array_map( 'ord', str_split( $raw ) );
 
-		// special-case: zero mask overwrites the whole tree with a pair of terminal successes
-		if ( $mask == 0 ) {
-			$node = array( true, true );
-			return;
-		}
-
 		// iterate the bits of the address while walking the tree structure for inserts
+		// at the end, $snode will point to the highest node that could only lead to a
+		// successful match (and thus can be set to true)
+		$snode =& $node;
 		$curBit = 0;
 		while ( 1 ) {
-			$maskShift = 7 - ( $curBit & 7 );
-			$node =& $node[( $rawOrd[$curBit >> 3] & ( 1 << $maskShift ) ) >> $maskShift];
-			++$curBit;
 			if ( $node === true ) {
 				// already added a larger supernet, no need to go deeper
-				return;
-			} elseif ( $curBit == $mask ) {
-				// this may wipe out deeper subnets from earlier
-				$node = true;
-				return;
-			} elseif ( $node === false ) {
-				// create new subarray to go deeper
-				$node = array( false, false );
+				return true;
 			}
+
+			if ( $curBit === $mask ) {
+				// this may wipe out deeper subnets from earlier
+				$snode = true;
+				return true;
+			}
+
+			if ( $node === false ) {
+				// create new subarray to go deeper
+				if ( !( $curBit & 7 ) && $curBit <= $mask - 8 ) {
+					$node = [ 'comp' => $rawOrd[$curBit >> 3], 'next' => false ];
+				} else {
+					$node = [ false, false ];
+				}
+			}
+
+			if ( isset( $node['comp'] ) ) {
+				$comp = $node['comp'];
+				if ( $rawOrd[$curBit >> 3] === $comp && $curBit <= $mask - 8 ) {
+					// whole byte matches, skip over the compressed node
+					$node =& $node['next'];
+					$snode =& $node;
+					$curBit += 8;
+					continue;
+				}
+
+				// have to decompress the node and check individual bits
+				$unode = $node['next'];
+				for ( $i = 0; $i < 8; ++$i ) {
+					$unode = ( $comp & ( 1 << $i ) )
+						? [ false, $unode ]
+						: [ $unode, false ];
+				}
+				$node = $unode;
+			}
+
+			$maskShift = 7 - ( $curBit & 7 );
+			$index = ( $rawOrd[$curBit >> 3] & ( 1 << $maskShift ) ) >> $maskShift;
+			if ( $node[$index ^ 1] !== true ) {
+				// no adjacent subnet, can't form a supernet at this level
+				$snode =& $node[$index];
+			}
+			$node =& $node[$index];
+			++$curBit;
 		}
-	}
+	} // @codeCoverageIgnore
 
 	/**
 	 * Match an IP address against the set
@@ -174,24 +205,24 @@ class IPSet {
 	 * @param string $ip string IPv[46] address
 	 * @return bool True is match success, false is match failure
 	 */
-	public function match( $ip ) {
+	public function match( $ip ): bool {
 		$raw = inet_pton( $ip );
 		if ( $raw === false ) {
-			return false; // inet_pton() sends an E_WARNING for us
+			return false;
 		}
 
 		$rawOrd = array_map( 'ord', str_split( $raw ) );
-		if ( count( $rawOrd ) == 4 ) {
+		if ( count( $rawOrd ) === 4 ) {
 			$node =& $this->root4;
 		} else {
 			$node =& $this->root6;
 		}
 
 		$curBit = 0;
-		while ( 1 ) {
+		while ( $node !== true && $node !== false ) {
 			if ( isset( $node['comp'] ) ) {
 				// compressed node, matches 1 whole byte on a byte boundary
-				if ( $rawOrd[$curBit >> 3] != $node['comp'] ) {
+				if ( $rawOrd[$curBit >> 3] !== $node['comp'] ) {
 					return false;
 				}
 				$curBit += 8;
@@ -202,83 +233,29 @@ class IPSet {
 				$node =& $node[( $rawOrd[$curBit >> 3] & ( 1 << $maskShift ) ) >> $maskShift];
 				++$curBit;
 			}
-
-			if ( $node === true || $node === false ) {
-				return $node;
-			}
 		}
+
+		return $node;
 	}
 
 	/**
-	 * Recursively merges adjacent nets into larger supernets
+	 * @param string $json
 	 *
-	 * @param array &$node Tree node to optimize, by-reference
-	 *
-	 *  e.g.: 8.0.0.0/8 + 9.0.0.0/8 -> 8.0.0.0/7
+	 * @return IPSet
 	 */
-	private static function recOptimize( &$node ) {
-		if ( $node[0] !== false && $node[0] !== true && self::recOptimize( $node[0] ) ) {
-			$node[0] = true;
-		}
-		if ( $node[1] !== false && $node[1] !== true && self::recOptimize( $node[1] ) ) {
-			$node[1] = true;
-		}
-		if ( $node[0] === true && $node[1] === true ) {
-			return true;
-		}
-		return false;
+	public static function newFromJson( string $json ): IPSet {
+		$ipset = new IPSet( [] );
+		$decoded = json_decode( $json, true );
+		$ipset->root4 = $decoded['ipv4'] ?? false;
+		$ipset->root6 = $decoded['ipv6'] ?? false;
+
+		return $ipset;
 	}
 
-	/**
-	 * Recursively compresses a tree
-	 *
-	 * @param array &$node Tree node to compress, by-reference
-	 * @param integer $curBit current depth in the tree
-	 * @param integer $maxCompStart maximum depth at which compression can start, family-specific
-	 *
-	 * This is a very simplistic compression scheme: if we go through a whole
-	 * byte of address starting at a byte boundary with no real branching
-	 * other than immediate false-vs-(node|true), compress that subtree down to a single
-	 * byte-matching node.
-	 * The $maxCompStart check elides recursing the final 7 levels of depth (family-dependent)
-	 */
-	private static function recCompress( &$node, $curBit, $maxCompStart ) {
-		if ( !( $curBit & 7 ) ) { // byte boundary, check for depth-8 single path(s)
-			$byte = 0;
-			$cnode =& $node;
-			$i = 8;
-			while ( $i-- ) {
-				if ( $cnode[0] === false ) {
-					$byte |= 1 << $i;
-					$cnode =& $cnode[1];
-				} elseif ( $cnode[1] === false ) {
-					$cnode =& $cnode[0];
-				} else {
-					// partial-byte branching, give up
-					break;
-				}
-			}
-			if ( $i == -1 ) { // means we did not exit the while() via break
-				$node = array(
-					'comp' => $byte,
-					'next' => &$cnode,
-				);
-				$curBit += 8;
-				if ( $cnode !== true ) {
-					self::recCompress( $cnode, $curBit, $maxCompStart );
-				}
-				return;
-			}
-		}
-
-		++$curBit;
-		if ( $curBit <= $maxCompStart ) {
-			if ( $node[0] !== false && $node[0] !== true ) {
-				self::recCompress( $node[0], $curBit, $maxCompStart );
-			}
-			if ( $node[1] !== false && $node[1] !== true ) {
-				self::recCompress( $node[1], $curBit, $maxCompStart );
-			}
-		}
+	public function jsonSerialize(): array {
+		return [
+			'ipv4' => $this->root4,
+			'ipv6' => $this->root6,
+		];
 	}
 }
